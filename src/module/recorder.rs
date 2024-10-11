@@ -436,104 +436,6 @@ impl YTAStatus {
         }
     }
 
-    /// parse_line parses a line of output from the ytarchive process.
-    ///
-    /// Sample output:
-    ///
-    ///   ytarchive 0.3.1-15663af
-    ///   Stream starts at 2022-03-14T14:00:00+00:00 in 11075 seconds. Waiting for this time to elapse...
-    ///   Stream is 30 seconds late...
-    ///   Selected quality: 1080p60 (h264)
-    ///   Video Fragments: 1215; Audio Fragments: 1215; Total Downloaded: 133.12MiB
-    ///   Download Finished
-    ///   Muxing final file...
-    ///   Final file: /path/to/output.mp4
-    pub fn parse_line_old(&mut self, line: &str) {
-        self.last_output = Some(line.to_string());
-        self.last_update = chrono::Utc::now();
-
-        if line.starts_with("Video Fragments: ") {
-            self.state = YTAState::Recording;
-            let mut parts = line.split(';').map(|s| s.split(':').nth(1).unwrap_or(""));
-            if let Some(x) = parts.next() {
-                self.video_fragments = x.trim().parse().ok();
-            };
-            if let Some(x) = parts.next() {
-                self.audio_fragments = x.trim().parse().ok();
-            };
-            if let Some(x) = parts.next() {
-                self.total_size = Some(strip_ansi(x.trim()));
-            };
-            return;
-        } else if line.starts_with("Audio Fragments: ") {
-            self.state = YTAState::Recording;
-            let mut parts = line.split(';').map(|s| s.split(':').nth(1).unwrap_or(""));
-            if let Some(x) = parts.next() {
-                self.audio_fragments = x.trim().parse().ok();
-            };
-            if let Some(x) = parts.next() {
-                self.total_size = Some(strip_ansi(x.trim()));
-            };
-            return;
-        }
-
-        // New versions of ytarchive prepend a timestamp to the output
-        // Sample line
-        // 2024/04/16 16:25:31
-        lazy_static! {
-            static ref TIMESTAMP_RE: Regex = Regex::new(r"^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}")
-                .expect("Failed to compile regex for detecting yta output timestamp");
-        }
-        let line = if line.len() > 20 && TIMESTAMP_RE.is_match(line) {
-            line[20..].trim()
-        } else {
-            line
-        };
-
-        if self.version == None && line.starts_with("ytarchive ") {
-            self.version = Some(strip_ansi(&line[10..]));
-        } else if self.video_quality == None && line.starts_with("Selected quality: ") {
-            self.video_quality = Some(strip_ansi(&line[18..]));
-        } else if line.starts_with("Stream starts at ") {
-            let date = DateTime::parse_from_rfc3339(&line[17..42])
-                .ok()
-                .map(|d| d.into());
-            self.state = YTAState::Waiting(date);
-        } else if line.starts_with("Stream is ") || line.starts_with("Waiting for stream") {
-            self.state = YTAState::Waiting(None);
-        } else if line.starts_with("Muxing final file") {
-            self.state = YTAState::Muxing;
-        } else if line.starts_with("Livestream has been processed") {
-            self.state = YTAState::AlreadyProcessed;
-        } else if line.starts_with("Livestream has ended and is being processed")
-            || line.contains("use yt-dlp to download it.")
-        {
-            self.state = YTAState::Ended;
-        } else if line.starts_with("Final file: ") {
-            self.state = YTAState::Finished;
-            self.output_file = Some(strip_ansi(&line[12..]));
-        } else if line.contains("User Interrupt") {
-            self.state = YTAState::Interrupted;
-        } else if line.contains("Error retrieving player response")
-            || line.contains("unable to retrieve")
-            || line.contains("error writing the muxcmd file")
-            || line.contains("Something must have gone wrong with ffmpeg")
-            || line.contains("At least one error occurred")
-        {
-            self.state = YTAState::Errored;
-        } else if line.trim().is_empty()
-            || line.contains("Loaded cookie file")
-            || line.starts_with("Video Title: ")
-            || line.starts_with("Channel: ")
-            || line.starts_with("Waiting for this time to elapse")
-            || line.starts_with("Download Finished")
-        {
-            // Ignore
-        } else {
-            warn!("Unknown ytarchive output: {}", line);
-        }
-    }
-
     // Example output from ytarchive 0.5.0:
     //
     // ytarchive 0.5.0
@@ -560,7 +462,7 @@ impl YTAStatus {
         }
         // Muxing regex
         lazy_static! {
-            static ref MUXING_RE: Regex = Regex::new(r"frame=\d*\s*fps=\d*\s*q=-?\d*\.\d*\s*Lsize=\s*\d*kB\s*time=\d{2}:\d{2}:\d{2}.\d{2}\s*bitrate=\d*\.*\dkbits/s\s*speed=\s*\d*x")
+            static ref MUXING_RE: Regex = Regex::new(r"^frame=\s*\d*\s*fps=\s*\d*\s*q=-?\d*\.\d*\s*Lsize=\s*\d*kB\s*time=\d{2}:\d{2}:\d{2}.\d{2}\s*bitrate=\s*\d*\.*\d*kbits/s\s*speed=\s*\d*x")
                 .expect("Failed to compile regex for detecting muxing line");
         }
 
@@ -599,7 +501,9 @@ impl YTAStatus {
         }
 
         // Muxing lines
-        if MUXING_RE.is_match(line) {
+        if MUXING_RE.is_match(line)
+            || line.starts_with("frame=")
+        {
             self.state = YTAState::Muxing;
             return;
         }
@@ -646,11 +550,13 @@ impl YTAStatus {
         // Waiting for stream time without a given date line
         if line.starts_with("Stream is ") || line.starts_with("Waiting for stream") {
             self.state = YTAState::Waiting(None);
+            return;
         }
         
         // Video has already been processed line
         if line.starts_with("Livestream has been processed") {
             self.state = YTAState::AlreadyProcessed;
+            return;
         }
         
         // Video has ended or is not a livestream line
@@ -658,11 +564,13 @@ impl YTAStatus {
             || line.starts_with("Livestream has ended and is being processed")
         {
             self.state = YTAState::Ended;
+            return;
         }
         
         // Interrupted lines
         if line.contains("User Interrupt") {
             self.state = YTAState::Interrupted;
+            return;
         }
         
         // Error lines
@@ -673,6 +581,7 @@ impl YTAStatus {
             || line.contains("At least one error occurred")
         {
             self.state = YTAState::Errored;
+            return;
         }
         
         // Lines to ignore
