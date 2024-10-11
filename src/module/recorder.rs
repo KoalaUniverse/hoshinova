@@ -448,7 +448,7 @@ impl YTAStatus {
     ///   Download Finished
     ///   Muxing final file...
     ///   Final file: /path/to/output.mp4
-    pub fn parse_line(&mut self, line: &str) {
+    pub fn parse_line_old(&mut self, line: &str) {
         self.last_output = Some(line.to_string());
         self.last_update = chrono::Utc::now();
 
@@ -532,5 +532,162 @@ impl YTAStatus {
         } else {
             warn!("Unknown ytarchive output: {}", line);
         }
+    }
+
+    // Example output from ytarchive 0.5.0:
+    //
+    // ytarchive 0.5.0
+    // 2024/10/11 02:09:14 Channel: Superweapons
+    // 2024/10/11 02:09:14 Video Title: Let's Play Power Washer Simulator career mode is this game good?
+    // 2024/10/11 02:09:15 Selected quality: 1080p60 (h264)
+    // 2024/10/11 02:09:15 Stream started at time 2024-10-10T22:51:51+00:00
+    // Video Fragments: 1613; Audio Fragments: 1613; Total Downloaded: 3.18GiB
+    // 2024/10/11 03:07:46 Download Finished
+    // 2024/10/11 03:07:46 Muxing final file...
+    // frame=483900 fps=9695 q=-1.0 Lsize= 3337210kB time=02:14:24.98 bitrate=3389.8kbits/s speed= 162x
+    // 2024/10/11 03:08:36
+    // Final file: F:\Documents\Docker\Hoshinova\Let's Play Power Washer Simulator career mode is this game good_-npgxC1yjbYw.mp4
+    pub fn parse_line(&mut self, line: &str) {
+        self.last_output = Some(line.to_string());
+        self.last_update = chrono::Utc::now();
+
+        // Regexes
+        // Timestamp regex
+        // 2024/04/16 16:25:31
+        lazy_static! {
+            static ref TIMESTAMP_RE: Regex = Regex::new(r"^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}")
+                .expect("Failed to compile regex for detecting yta output timestamp");
+        }
+        // Muxing regex
+        lazy_static! {
+            static ref MUXING_RE: Regex = Regex::new(r"frame=\d*\s*fps=\d*\s*q=-?\d*\.\d*\s*Lsize=\s*\d*kB\s*time=\d{2}:\d{2}:\d{2}.\d{2}\s*bitrate=\d*\.*\dkbits/s\s*speed=\s*\d*x")
+                .expect("Failed to compile regex for detecting muxing line");
+        }
+
+        // -------------------------------------------------------------
+        // First, parse all the lines that do not start with a timestamp
+        // Version line
+        if self.version == None && line.starts_with("ytarchive ") {
+            self.version = Some(strip_ansi(&line[10..]));
+            return;
+        }
+
+        // Media downloading lines
+        if line.starts_with("Video Fragments: ") {
+            self.state = YTAState::Recording;
+            let mut parts = line.split(';').map(|s| s.split(':').nth(1).unwrap_or(""));
+            if let Some(x) = parts.next() {
+                self.video_fragments = x.trim().parse().ok();
+            };
+            if let Some(x) = parts.next() {
+                self.audio_fragments = x.trim().parse().ok();
+            };
+            if let Some(x) = parts.next() {
+                self.total_size = Some(strip_ansi(x.trim()));
+            };
+            return;
+        } else if line.starts_with("Audio Fragments: ") {
+            self.state = YTAState::Recording;
+            let mut parts = line.split(';').map(|s| s.split(':').nth(1).unwrap_or(""));
+            if let Some(x) = parts.next() {
+                self.audio_fragments = x.trim().parse().ok();
+            };
+            if let Some(x) = parts.next() {
+                self.total_size = Some(strip_ansi(x.trim()));
+            };
+            return;
+        }
+
+        // Muxing lines
+        if MUXING_RE.is_match(line) {
+            self.state = YTAState::Muxing;
+            return;
+        }
+
+        // Final file line
+        if line.starts_with("Final file: ") {
+            self.state = YTAState::Finished;
+            self.output_file = Some(strip_ansi(&line[12..]));
+            return;
+        }
+        
+
+        // -------------------------------------------------------------
+        // Next, parse all the lines that start with a timestamp
+
+        // If the line only contains the timestamp, ignore it
+        if line.len() <= 20 {
+            return;
+        }
+
+        // Remove the timestamp from the line
+        let line = line[20..].trim();
+
+        // Selected quality line
+        if self.video_quality == None && line.starts_with("Selected quality: ") {
+            self.video_quality = Some(strip_ansi(&line[18..]));
+            return;
+        }
+
+        // Muxing final file line
+        if line.starts_with("Muxing final file") {
+            self.state = YTAState::Muxing;
+            return;
+        }
+
+        // Waiting for stream line
+        if line.starts_with("Stream starts at ") {
+            let date = DateTime::parse_from_rfc3339(&line[17..42])
+                .ok()
+                .map(|d| d.into());
+            self.state = YTAState::Waiting(date);
+            return;
+        }
+        // Waiting for stream time without a given date line
+        if line.starts_with("Stream is ") || line.starts_with("Waiting for stream") {
+            self.state = YTAState::Waiting(None);
+        }
+        
+        // Video has already been processed line
+        if line.starts_with("Livestream has been processed") {
+            self.state = YTAState::AlreadyProcessed;
+        }
+        
+        // Video has ended or is not a livestream line
+        if line.starts_with("Livestream has been processed")
+            || line.starts_with("Livestream has ended and is being processed")
+        {
+            self.state = YTAState::Ended;
+        }
+        
+        // Interrupted lines
+        if line.contains("User Interrupt") {
+            self.state = YTAState::Interrupted;
+        }
+        
+        // Error lines
+        if line.contains("Error retrieving player response")
+            || line.contains("unable to retrieve")
+            || line.contains("error writing the muxcmd file")
+            || line.contains("Something must have gone wrong with ffmpeg")
+            || line.contains("At least one error occurred")
+        {
+            self.state = YTAState::Errored;
+        }
+        
+        // Lines to ignore
+        if line.trim().is_empty()
+            || line.contains("Loaded cookie file")
+            || line.starts_with("Channel: ")
+            || line.starts_with("Video Title: ")
+            || line.starts_with("Waiting for this time to elapse")
+            || line.starts_with("Download Finished")
+            || line.starts_with("Stream started at time")
+        {
+            return;
+        }
+        
+        // If we reach this point, the line is unknown
+        warn!("Unknown ytarchive output: {}", line);
     }
 }
