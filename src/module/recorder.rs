@@ -436,22 +436,14 @@ impl YTAStatus {
         }
     }
 
-    // Example output from ytarchive 0.5.0:
-    //
-    // ytarchive 0.5.0
-    // 2024/10/11 02:09:14 Channel: Superweapons
-    // 2024/10/11 02:09:14 Video Title: Let's Play Power Washer Simulator career mode is this game good?
-    // 2024/10/11 02:09:15 Selected quality: 1080p60 (h264)
-    // 2024/10/11 02:09:15 Stream started at time 2024-10-10T22:51:51+00:00
-    // Video Fragments: 1613; Audio Fragments: 1613; Total Downloaded: 3.18GiB
-    // 2024/10/11 03:07:46 Download Finished
-    // 2024/10/11 03:07:46 Muxing final file...
-    // frame=483900 fps=9695 q=-1.0 Lsize= 3337210kB time=02:14:24.98 bitrate=3389.8kbits/s speed= 162x
-    // 2024/10/11 03:08:36
-    // Final file: F:\Documents\Docker\Hoshinova\Let's Play Power Washer Simulator career mode is this game good_-npgxC1yjbYw.mp4
-    pub fn parse_line(&mut self, line: &str) {
-        self.last_output = Some(line.to_string());
+    pub fn parse_line(&mut self, original_line: &str) {
+        self.last_output = Some(original_line.to_string());
         self.last_update = chrono::Utc::now();
+
+        // Make sure to stop when done
+        if self.state == YTAState::Finished {
+            return;
+        }
 
         // Regexes
         // Timestamp regex
@@ -469,15 +461,15 @@ impl YTAStatus {
         // -------------------------------------------------------------
         // First, parse all the lines that do not start with a timestamp
         // Version line
-        if self.version == None && line.starts_with("ytarchive ") {
-            self.version = Some(strip_ansi(&line[10..]));
+        if self.version == None && original_line.starts_with("ytarchive ") {
+            self.version = Some(strip_ansi(&original_line[10..]));
             return;
         }
 
         // Media downloading lines
-        if line.starts_with("Video Fragments: ") {
+        if original_line.starts_with("Video Fragments: ") {
             self.state = YTAState::Recording;
-            let mut parts = line.split(';').map(|s| s.split(':').nth(1).unwrap_or(""));
+            let mut parts = original_line.split(';').map(|s| s.split(':').nth(1).unwrap_or(""));
             if let Some(x) = parts.next() {
                 self.video_fragments = x.trim().parse().ok();
             };
@@ -488,9 +480,10 @@ impl YTAStatus {
                 self.total_size = Some(strip_ansi(x.trim()));
             };
             return;
-        } else if line.starts_with("Audio Fragments: ") {
+        }
+        if original_line.starts_with("Audio Fragments: ") {
             self.state = YTAState::Recording;
-            let mut parts = line.split(';').map(|s| s.split(':').nth(1).unwrap_or(""));
+            let mut parts = original_line.split(';').map(|s| s.split(':').nth(1).unwrap_or(""));
             if let Some(x) = parts.next() {
                 self.audio_fragments = x.trim().parse().ok();
             };
@@ -501,31 +494,31 @@ impl YTAStatus {
         }
 
         // Muxing lines
-        if MUXING_RE.is_match(line)
-            || line.starts_with("frame=")
+        if MUXING_RE.is_match(original_line)
+            || original_line.starts_with("frame=")
+            || original_line.starts_with("size=")
         {
             self.state = YTAState::Muxing;
             return;
         }
 
         // Final file line
-        if line.starts_with("Final file: ") {
+        if original_line.starts_with("Final file: ") {
             self.state = YTAState::Finished;
-            self.output_file = Some(strip_ansi(&line[12..]));
+            self.output_file = Some(strip_ansi(&original_line[12..]));
             return;
         }
-        
 
         // -------------------------------------------------------------
         // Next, parse all the lines that start with a timestamp
 
         // If the line only contains the timestamp, ignore it
-        if line.len() <= 20 {
+        if original_line.len() <= 20 {
             return;
         }
 
         // Remove the timestamp from the line
-        let line = line[20..].trim();
+        let line = original_line[20..].trim();
 
         // Selected quality line
         if self.video_quality == None && line.starts_with("Selected quality: ") {
@@ -597,6 +590,6 @@ impl YTAStatus {
         }
         
         // If we reach this point, the line is unknown
-        warn!("Unknown ytarchive output: {}", line);
+        warn!("Unknown ytarchive output: {}", original_line);
     }
 }
