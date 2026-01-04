@@ -52,7 +52,7 @@ RUN set -ex; \
     apk add --no-cache git; \
     git clone https://github.com/Kethsar/ytarchive.git; \
     cd ytarchive; \
-    git checkout 99a510d; \
+    git checkout 2110ce2; \
     go build .
 
 FROM alpine AS runner
